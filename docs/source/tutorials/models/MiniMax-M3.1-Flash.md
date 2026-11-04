@@ -31,7 +31,7 @@ The official release of MiniMax-M3.1-Flash is available on [Hugging Face](https:
 
 | Weight Version | Deployment | Model Path |
 | --- | --- | --- |
-| MiniMax-M3.1-Flash-W8A8 | Atlas 800I A2, two-node PD colocation <br> Atlas 800I A3, three-node PD disaggregation (1P2D) | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Minimax-M3.1-Flash-w8a8) |
+| MiniMax-M3.1-Flash-W8A8 | Atlas 800I A2, two-node PD colocation <br> Atlas 800I A3, single-node or three-node PD disaggregation (1P2D) | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Minimax-M3.1-Flash-w8a8) |
 | MiniMax-M3.1-Flash-MXFP8 | 950DT products, three-node PD disaggregation (1P2D) | [ModelScope](https://www.modelscope.cn/models/Eco-Tech/Minimax-M3.1-Flash-w8a8-mxfp8) |
 
 Download the weight variant used by the serving commands to the same model directory on all participating nodes. It is recommended to place the model weight in a shared cache directory.
@@ -1201,6 +1201,150 @@ Monitor the role logs while weights load and graph capture completes. Startup du
     ```
 
     Each Decode node registers one endpoint that fronts its two local DP ranks, so the proxy lists two Decode hosts even though the DP group has four ranks. Send requests to port `19080` with model name `minimax-m3.1-flash`.
+
+### 5.4 PD Disaggregation with KV Cache Pool
+
+KV cache pooling extends PD disaggregation with three-tier storage: NPU KV cache, a Mooncake memory pool, and local SSD offload. `MultiConnector` combines `MooncakeConnectorV1` for live P-to-D transfer with `AscendStoreConnector` for prefix reuse through the pool. Refer to the [KV Cache Pool Deployment Guide](../../user_guide/feature_guide/kv_cache_pool_ascend_store.md) for dependencies and backend configuration.
+
+=== "A3 series (W8A8)"
+
+    Reuse the A3 1P2D scripts in [Section 5.3](#53-pd-disaggregation-1p2d), including their model, DSpark settings, DP/TP/PP layout, API ports, and proxy mapping. The following configuration uses the A3 HCCS fabric-memory path with 16 NPU workers on each of three nodes. P performs pool lookup, load, and write; all three nodes contribute storage.
+
+    **Prepare the Memory Pool and SSD Tier**
+
+    Use the A3 container from [Section 4.2](#42-a3-docker-container), including the `/etc/hccn.conf` mount. On each host, choose a directory on a local SSD filesystem with enough free space. For example, if the SSD is mounted at `/data/nvme`:
+
+    ```bash
+    mkdir -p /data/nvme/mooncake_offload
+    findmnt -T /data/nvme/mooncake_offload
+    df -hT /data/nvme/mooncake_offload
+    ```
+
+    Confirm the directory is on the local SSD, then add this volume to the A3 `docker run` command before creating the container:
+
+    ```bash
+    -v /data/nvme/mooncake_offload:/nvme/mooncake_offload
+    ```
+
+    Use an absolute, writable container path without symlinks. The same path on P, D1, and D2 refers to separate local storage. A shared network filesystem is not the SSD tier.
+
+    Save the following as `/workspace/mooncake.json` in each container. Replace `<MOONCAKE_MASTER_IP>` with one reachable host IP, for example the P node IP. Use the same Master address and `tenant_id` on all nodes.
+
+    ```json
+    {
+        "metadata_server": "P2PHANDSHAKE",
+        "protocol": "ascend",
+        "device_name": "",
+        "master_server_address": "<MOONCAKE_MASTER_IP>:50088",
+        "global_segment_size": "4GB",
+        "preferred_segment": false,
+        "prefer_alloc_in_same_node": true,
+        "enable_ssd_offload": true,
+        "ssd_offload_path": "/nvme/mooncake_offload",
+        "tenant_id": "default"
+    }
+    ```
+
+    `global_segment_size` is allocated per NPU worker, not per DP replica or host. The `4GB` setting allocates 64 GiB per 16-worker node and 192 GiB across this 1P2D deployment. Size it for the available fabric-memory quota after allowing for vLLM and other processes. Non-zero sizes must be aligned to 1 GiB. Each worker also needs a separate 1 GiB SSD I/O buffer in this example.
+
+    Save the following as `/workspace/pool_env.sh` on P, D1, and D2, alongside the serving scripts:
+
+    ```bash
+    #!/usr/bin/env bash
+
+    export MOONCAKE_CONFIG_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/mooncake.json"
+    # Use the Master address and segment size from mooncake.json.
+    unset MOONCAKE_MASTER MOONCAKE_GLOBAL_SEGMENT_SIZE
+    export PYTHONHASHSEED=0
+    export ASCEND_ENABLE_USE_FABRIC_MEM=1
+    export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1073741824
+    # SSD budget per NPU worker: 10 GiB.
+    export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=10737418240
+    export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=10737418240
+    export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
+    ```
+
+    The two SSD limits describe the same 10 GiB budget per worker: the capacity reported to Master and the local bucket limit. They give 160 GiB per node and 480 GiB across 48 workers, not twice that capacity. Adjust both limits together for the usable SSD space and prefix working set. These disk limits do not change the memory segment or I/O buffer size.
+
+    **Update the Existing Prefill and Decode Scripts**
+
+    Use `run_prefill.sh`, `run_decode_d1.sh`, and `run_decode_d2.sh` from Section 5.3. Keep their existing environment settings, including `ASCEND_LOCAL_COMM_RES`, and all serving arguments except `--kv-transfer-config`.
+
+    In `run_prefill.sh`, insert the following immediately before `vllm serve`:
+
+    ```bash
+    source "$(dirname "${BASH_SOURCE[0]}")/pool_env.sh"
+    KV_ROLE=kv_producer
+    LOOKUP_RPC_PORT=37000
+    ```
+
+    In both `run_decode_d1.sh` and `run_decode_d2.sh`, insert the following immediately before `vllm serve`, after `DP_RANK` has been computed:
+
+    ```bash
+    source "$(dirname "${BASH_SOURCE[0]}")/pool_env.sh"
+    KV_ROLE=kv_consumer
+    LOOKUP_RPC_PORT=$((37100 + DP_RANK))
+    ```
+
+    `DP_RANK` is the global rank: 0–3 on D1 and 4–7 on D2. Each independently launched service therefore has a distinct `lookup_rpc_port`: `37000` on P, `37100`–`37103` on D1, and `37104`–`37107` on D2. This is the pool's local scheduler/worker IPC identifier, separate from the KV-transfer and HTTP ports.
+
+    In all three scripts, replace the complete existing `--kv-transfer-config` argument with the following. `KV_PORT` retains the value already defined in each script:
+
+    ```bash
+    --kv-transfer-config '{
+        "kv_connector": "MultiConnector",
+        "kv_role": "'"$KV_ROLE"'",
+        "kv_connector_extra_config": {
+            "connectors": [
+                {
+                    "kv_connector": "MooncakeConnectorV1",
+                    "kv_buffer_device": "npu",
+                    "kv_role": "'"$KV_ROLE"'",
+                    "kv_port": '"$KV_PORT"',
+                    "kv_connector_extra_config": {
+                        "use_ascend_direct": true,
+                        "prefill": {"dp_size": 1, "tp_size": 4, "pp_size": 4, "pp_layer_partition": "15,15,15,15"},
+                        "decode": {"dp_size": 8, "tp_size": 4, "pp_size": 1}
+                    }
+                },
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_role": "'"$KV_ROLE"'",
+                    "kv_connector_extra_config": {
+                        "backend": "mooncake",
+                        "lookup_rpc_port": '"$LOOKUP_RPC_PORT"'
+                    }
+                }
+            ]
+        }
+    }'
+    ```
+
+    **Start the Services**
+
+    Stop the previous deployment before reusing its NPUs and ports. Start one Mooncake Master on the host configured in `mooncake.json`:
+
+    ```bash
+    nohup mooncake_master \
+        --port 50088 \
+        --eviction_high_watermark_ratio 0.9 \
+        --eviction_ratio 0.1 \
+        --default_kv_lease_ttl 11000 \
+        --enable_offload=true \
+        --client_ttl=120 > master.log 2>&1 &
+    ```
+
+    Confirm port `50088` is reachable from all three nodes. `default_kv_lease_ttl` is in milliseconds and `client_ttl` is in seconds. Both Master and `mooncake.json` must enable offload for the SSD tier.
+
+    With Master running, use the Section 5.3 launch commands to start the updated D1 and D2 scripts, followed by P. Start both D nodes promptly so the global DP8 group can initialize. Once all nine APIs are ready, start the same `proxy_server.sh`; its endpoint mapping is unchanged. Send requests to the proxy on port `19080` with model name `minimax-m3.1-flash`. The service log names remain those in Section 5.3, with `master.log` added for Mooncake Master.
+
+    **Verify the Deployment**
+
+    1. Check Master and worker logs for successful registration of the memory segments and SSD storage. With the example budgets, all 48 workers together register 192 GiB of memory and 480 GiB of SSD capacity. Registered capacity is not the amount of data already stored.
+    2. Check `/health` on P `19100`, D1 `19200`–`19203`, and D2 `19300`–`19303`. Send the text request in [Section 6.1](#61-text) to the proxy and confirm it completes successfully.
+    3. Warm up with repeated-prefix requests, then check the P log for `kvpool hit tokens` and the D logs for successful P-to-D KV transfer. A local NPU prefix-cache hit alone does not establish a memory-pool hit.
+    4. To exercise the SSD tier, use multiple prefixes with a combined KV working set larger than the memory pool. Check SSD writes and subsequent reads in Mooncake logs and storage usage. A memory-pool hit or a configured SSD capacity alone does not verify SSD reuse.
+    5. If workers report allocation failures or KV put errors, inspect the per-worker memory/SSD budgets and the prefix working set. Reduce the segment size when fabric memory cannot be allocated; increase SSD limits only when the local disks have sufficient capacity.
 
 ## 6 Functional Verification
 
